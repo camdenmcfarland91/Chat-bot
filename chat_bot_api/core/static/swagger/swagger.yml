@@ -150,7 +150,11 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/User"
+                type: object
+                properties:
+                  message:
+                    type: string
+                    example: "User created successfully"
         "400":
           $ref: "#/components/responses/ValidationError"
         "500":
@@ -198,7 +202,11 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/User"
+                type: object
+                properties:
+                  message:
+                    type: string
+                    example: "User updated successfully"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "404":
@@ -221,6 +229,14 @@ paths:
       responses:
         "204":
           description: User deleted sucessfully.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                    example: "User deleted successfully"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":
@@ -318,7 +334,7 @@ paths:
               properties:
                 prompt:
                   type: string
-                  example: "Which is the best programming language?"
+                  example: "What's the garbage collector in Python?"
       responses:
         '200':
           description: query on trained model returned successfully.
@@ -349,15 +365,17 @@ paths:
                       similarity:
                         type: int
               example:
-                result_1:
-                  content: "This is some example content for result 1."
-                  similarity: 0.5700613555953692
-                result_2:
-                  content: "This is some example content for result 2."
-                  similarity: 0.33197371310011686
-                result_3:
-                  content: "This is some example content for result 3."
-                  similarity: 0.2817058248812313
+                example_result_1:
+                  response: "Python's garbage collector primarily uses reference counting..."
+                  confidence: "High"
+                  references:
+                    content: "instead of this piece of code..."
+                    similarity: 0.65
+                    metadata: "https://Stackoverflow.com/questions/29369317"
+                example_result_2:
+                  is_greeting: true
+                  response: "Good morning"
+                  english_translation: "Good morning"
         '400':
           description: "Requisition error. No sentence provided."
           content:

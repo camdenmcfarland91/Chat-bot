@@ -288,8 +288,6 @@ export async function createMessage(chat_id: number, text: string, is_user: bool
         throw new Error("Chat id must not be null");
     }
 
-    console.log("text:", text, "is_user:", is_user);
-
     // TODO: caso não haja texto, mandar como mensagem do bot que houve algum erro
 
     try{

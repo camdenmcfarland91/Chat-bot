@@ -206,12 +206,13 @@ class DataConsolidationService:
 class CreateFaissTreeService:
     ''''''
 
-    def __init__(self, documents_batch_size: int = 5000) -> object:
+    def __init__(self, documents_batch_size: int = 5000):
         self._documents_batch_size = documents_batch_size
+        self._embedding_model = None
 
     def _clean_text(self, text: str) -> str:
         ''''''
-        
+
         if not isinstance(text, str):
             return ""
         
@@ -221,7 +222,7 @@ class CreateFaissTreeService:
         
         except Exception:
             pass
-        
+
         text = re.sub(r'http\S+|www\S+|https\S+', '', text, flags = re.MULTILINE)
         text = re.sub(r'\[([^\]]*)\]\([^\)]*\)?', r'\1', text)
         text = re.sub(r'```[a-zA-Z]*\n', '', text)
@@ -243,15 +244,16 @@ class CreateFaissTreeService:
 
         documents_df['text_for_chunking'] = documents_df['question'] + "\n\nAnswers:\n" + documents_df['consolidated_answers']
         documents_df['raw_chunks'] = documents_df['text_for_chunking'].apply(lambda text: text_splitter.split_text(text))
-
+        
         chunks_df = documents_df[['parent_index', 'metadata', 'raw_chunks']].explode('raw_chunks')
         chunks_df = chunks_df.rename(columns = {'raw_chunks': 'raw_text_chunk'})
+
         chunks_df['cleaned_text_chunk'] = chunks_df['raw_text_chunk'].apply(self._clean_text)
         chunks_df = chunks_df[chunks_df['cleaned_text_chunk'].str.strip().astype(bool)].reset_index(drop = True)
-
+        
         return chunks_df
 
-    def _process_embeddings_batch(self, chunks_df: pd.DataFrame, embedding_model, batch_size: int = 512):
+    def _process_embeddings_batch(self, chunks_df: pd.DataFrame, batch_size: int = 512):
         ''''''
 
         embeddings_data = []
@@ -262,13 +264,14 @@ class CreateFaissTreeService:
             
             texts_to_embed = batch_chunks['cleaned_text_chunk'].tolist()
             texts_to_store = batch_chunks['raw_text_chunk'].tolist()
+            
             metadatas = [
                 {'parent_index': row.parent_index, 'metadata_link': row.metadata}
-                for row in batch_chunks.itertuples(index=False)
+                for row in batch_chunks.itertuples(index = False)
             ]
             
             if texts_to_embed:
-                embeddings = embedding_model.embed_documents(texts_to_embed)
+                embeddings = self._embedding_model.embed_documents(texts_to_embed)
                 
                 for text, embedding, metadata in zip(texts_to_store, embeddings, metadatas):
                     embeddings_data.append((text, embedding, metadata))
@@ -277,86 +280,103 @@ class CreateFaissTreeService:
         
         return embeddings_data
 
+    def _initialize_embedding_model(self):
+        ''''''
+
+        if self._embedding_model is None:
+            self._embedding_model = HuggingFaceEmbeddings(
+                model_name = 'all-MiniLM-L6-v2',
+                model_kwargs = {"device": "cuda" if torch.cuda.is_available() else "cpu"}
+            )
+
+    def _update_task_status(self, task_id: str, message: str):
+        ''''''
+
+        if task_id:
+            TaskStatus.objects.filter(task_id = task_id).update(
+                status = states.PENDING,
+                result = message
+            )
+
+    def _fetch_document_batch(self, offset: int) -> pd.DataFrame:
+        ''''''
+
+        queryset = Document.objects.values().order_by('id')[offset:offset + self._documents_batch_size]
+        
+        return pd.DataFrame.from_records(queryset)
+
+    def _add_to_vectorstore(self, vectorstore, embeddings_data):
+        ''''''
+
+        if not embeddings_data:
+            return vectorstore
+
+        texts, embeddings, metadatas = zip(*embeddings_data)
+        text_embedding_pairs = list(zip(texts, embeddings))
+
+        if vectorstore is None:
+            vectorstore = FAISS.from_embeddings(
+                text_embedding_pairs, 
+                self._embedding_model, 
+                metadatas = list(metadatas)
+            )
+
+        else:
+            vectorstore.add_embeddings(
+                text_embedding_pairs, 
+                metadatas = list(metadatas)
+            )
+        
+        return vectorstore
+
     def create_faiss_index(self, batch_size: int = 512, faiss_save_path: str = 'faiss_index', task_id: str = None) -> None:
         ''''''
-        
-        embedding_model = HuggingFaceEmbeddings(
-            model_name='all-MiniLM-L6-v2',
-            model_kwargs={"device": "cuda" if torch.cuda.is_available() else "cpu"}
-        )
+
+        self._initialize_embedding_model()
         
         total_documents = Document.objects.count()
+        
         if total_documents == 0:
             raise ValueError("Nenhum documento encontrado no banco de dados")
         
         vectorstore = None
-        processed_docs = 0
+        processed_docs_count = 0
         
         for offset in range(0, total_documents, self._documents_batch_size):
-            if task_id:
-                TaskStatus.objects.filter(task_id = task_id).update(
-                    status = states.PENDING,
-                    result = f'Processando embeddings: {processed_docs}/{total_documents} documentos'
-                )
+            self._update_task_status(
+                task_id,
+                f'Processando embeddings: {processed_docs_count}/{total_documents} documentos'
+            )
             
-            queryset = Document.objects.values().order_by('id')[offset:offset + self._documents_batch_size]
-            documents_df = pd.DataFrame.from_records(queryset)
+            documents_df = self._fetch_document_batch(offset)
             
             if documents_df.empty:
                 continue
-            
+
             chunks_df = self._create_chunks_batch(documents_df)
-            
-            del documents_df
-            gc.collect()
+            del documents_df; gc.collect()
             
             if chunks_df.empty:
                 continue
             
-            embeddings_data = self._process_embeddings_batch(chunks_df, embedding_model, batch_size)
-            
-            del chunks_df
-            gc.collect()
-            
-            if not embeddings_data:
-                continue
-            
-            texts_to_store = [item[0] for item in embeddings_data]
-            embeddings = [item[1] for item in embeddings_data]
-            metadatas = [item[2] for item in embeddings_data]
-            
-            text_embedding_pairs = list(zip(texts_to_store, embeddings))
-            
-            if vectorstore is None:
-                vectorstore = FAISS.from_embeddings(text_embedding_pairs, embedding_model, metadatas = metadatas)
-            else:
-                vectorstore.add_embeddings(text_embedding_pairs, metadatas = metadatas)
-            
-            del embeddings_data, text_embedding_pairs, texts_to_store, embeddings, metadatas
-            gc.collect()
-            
-            processed_docs += min(self._documents_batch_size, total_documents - processed_docs)
-            
-            if task_id:
-                TaskStatus.objects.filter(task_id = task_id).update(
-                    status = states.PENDING,
-                    result = f'Embeddings processados: {processed_docs}/{total_documents} documentos'
-                )
-        
+            embeddings_data = self._process_embeddings_batch(chunks_df, batch_size)
+            del chunks_df; gc.collect()
+
+            vectorstore = self._add_to_vectorstore(vectorstore, embeddings_data)
+            del embeddings_data; gc.collect()
+
+            processed_docs_count += self._documents_batch_size
+            processed_docs_count = min(processed_docs_count, total_documents)
+
         if vectorstore:
-            if task_id:
-                TaskStatus.objects.filter(task_id = task_id).update(
-                    status = states.PENDING,
-                    result = 'Salvando índice FAISS...'
-                )
-            
+            self._update_task_status(task_id, 'Salvando índice FAISS...')
             vectorstore.save_local(faiss_save_path)
             
-            del vectorstore, embedding_model
-            gc.collect()
+            del vectorstore, self._embedding_model; gc.collect()
+            self._embedding_model = None
         
         else:
-            raise ValueError("O vectorstore não foi criado. Nenhum documento foi processado ou adicionado ao índice.")
+            raise ValueError("O vectorstore não foi criado. Nenhum documento foi processado.")
 
 
 
@@ -383,11 +403,32 @@ class GetResponseFromGeminiService:
         ''''''
         
         prompt_template = """
-            Você é um classificador de saudações. Seu trabalho é verificar se uma frase enviada por um usuário é uma saudação como "olá", "oi", "bom dia", etc.
-            - Se for uma saudação, responda com uma saudação apropriada, como "Olá!", "Boa noite!", etc.
-            - Se não for uma saudação, responda apenas com a palavra: other
-            Frase: {question}
-            Resposta:
+            You are the initial processing layer for a helpful AI assistant. Your primary job is to determine if a user's first message is a greeting.
+
+            - If the user's phrase is a greeting (e.g., "hello", "hi", "good afternoon"), you must reply with a friendly and helpful response that immediately offers assistance.
+            - If the user's phrase is NOT a greeting, you must reply only with the single word: other
+
+            Here are some examples of how to behave:
+
+            User phrase: Hi
+            Answer: Hello! How can I help you today?
+
+            User phrase: good morning
+            Answer: Good morning! What can I do for you?
+
+            User phrase: hey there
+            Answer: Hi there! I'm ready to help. What's on your mind?
+
+            User phrase: I need to check my order status
+            Answer: other
+
+            User phrase: how much is this?
+            Answer: other
+
+            ---
+
+            User phrase: {question}
+            Answer:
         """
 
         greeting_llm = ChatGoogleGenerativeAI(model = "gemini-1.5-flash", temperature=0.7)
@@ -399,7 +440,7 @@ class GetResponseFromGeminiService:
         
         return result if result != "other" else "other"
     
-    def _choose_best_prompt(self, best_score: float) -> str:
+    def _choose_best_prompt(self, best_score: float) -> tuple[str, str | None, str]:
         ''''''
 
         HIGH_CONFIDENCE_THRESHOLD = 0.85
@@ -407,28 +448,32 @@ class GetResponseFromGeminiService:
 
         if best_score < HIGH_CONFIDENCE_THRESHOLD:
             return """
-                Você é um assistente de programação especialista em Python, preciso e direto. Baseado estritamente no contexto a seguir, responda à pergunta do usuário. Se a resposta contiver código, formate-o corretamente.
+                You are an expert Python programming assistant. Your response must be precise, direct, and based strictly on the provided context.
+                Directly answer the user's question using only the information from the context below.
+                If your answer includes code, ensure it is correctly formatted in a markdown code block.
 
-                Contexto:
+                Context:
                 {context}
 
-                Pergunta do Usuário:
+                User's Question:
                 {question}
-            """
-        
+            """, "High"
+
         elif best_score < MEDIUM_CONFIDENCE_THRESHOLD:
             return """
-                Você é um assistente de programação especialista e um excelente professor. O contexto fornecido abaixo é tematicamente relacionado à pergunta do usuário, mas pode não ser uma resposta direta. Sua principal tarefa é analisar esses exemplos práticos e sintetizar o princípio geral que eles demonstram. Comece sua resposta de forma cautelosa (ex: "Com base nas informações disponíveis...").
+                You are an expert programmer and a skilled teacher. The provided context is thematically related to the user's question but might not contain a direct answer.
+                Your primary task is to analyze the examples in the context and synthesize the underlying principle they demonstrate.
+                Begin your response with a cautious tone. For example: "Based on the provided information...", "While the context doesn't directly answer your question, it seems to illustrate...", or a similar introductory phrase.
 
-                Contexto:
+                Context:
                 {context}
 
-                Pergunta do Usuário:
+                User's Question:
                 {question}
-            """
+            """, "Medium"
         
         else:
-            return json.dumps([{"response": "Não encontrei informações suficientemente relevantes.", "references": []}], indent = 2)
+            return None, "Low"
         
     def _filter_best_references(self, vector_results) -> list:
         ''''''
@@ -460,7 +505,7 @@ class GetResponseFromGeminiService:
 
         return parent_indices
     
-    def _create_response(self, parent_indices: dict, response_text) -> list:
+    def _create_response(self, parent_indices: dict, response_text, confidence: str) -> list:
         ''''''
 
         references_list = []
@@ -477,7 +522,7 @@ class GetResponseFromGeminiService:
                     "metadata": original_doc_row['metadata']
                 })
 
-        return [{"response": response_text, "references": references_list}]
+        return [{"response": response_text, "confidence": confidence, "references": references_list}]
 
 
 
@@ -492,7 +537,19 @@ class GetResponseFromGeminiService:
         best_score = vector_results[0][1]
         context_for_llm = "\n\n---\n\n".join([doc.page_content for doc, score in vector_results])
 
-        appropriate_prompt = self._choose_best_prompt(best_score)
+        appropriate_prompt, confidence = self._choose_best_prompt(best_score)
+
+        if appropriate_prompt is None:
+            return json.dumps(
+                [
+                    {
+                        "response": "I couldn't find sufficiently relevant information to answer your question.",
+                        "confidence": confidence,
+                        "references": []
+                    }
+                ],
+                indent = 2
+            )
 
         prompt_template = PromptTemplate.from_template(appropriate_prompt)
         chain = prompt_template | self.llm
@@ -502,7 +559,7 @@ class GetResponseFromGeminiService:
 
         filtered_results = self._filter_best_references(vector_results)
         parent_indices = self._retrieve_original_ref_index(filtered_results)
-        final_output = self._create_response(parent_indices, response_text)
+        final_output = self._create_response(parent_indices, response_text, confidence)
         
         return json.dumps(final_output, indent = 2)
 
